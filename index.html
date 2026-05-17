@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>1v1 Action Prototype</title>
+    <style>
+      html, body { margin: 0; padding: 0; background: #0e0f12; overflow: hidden; }
+      body { display: flex; align-items: center; justify-content: center; height: 100vh; }
+      #stage { display: block; outline: none; }
+      #hud {
+        position: fixed; top: 8px; left: 8px;
+        color: #cfd2da; font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace;
+        pointer-events: none; user-select: none;
+        white-space: pre;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="stage"></div>
+    <div id="hud"></div>
+    <script type="module" src="/src/app/main.ts"></script>
+  </body>
+</html>

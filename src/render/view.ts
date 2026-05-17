@@ -1,15 +1,37 @@
-import { Container, Graphics, type Application } from 'pixi.js';
-import { CHAR_H, CHAR_W, GROUND_Y, STAGE_H, STAGE_W } from '../sim/constants.js';
+import { Container, Sprite, type Application } from 'pixi.js';
+import type { CharState } from '../sim/actions.js';
+import { STAGE_H, STAGE_W } from '../sim/constants.js';
 import type { Player, World } from '../sim/world.js';
+import type { CharTextures, GameTextures } from './assets.js';
 
-// windup telegraph: 공격자가 0.5초 동안 색이 변해 상대가 회피로 대응할 수 있게 한다.
-// 진행도(t)에 따라 점점 진해지면 "곧 active" 강도가 시각적으로 증가 — 게임 디자인 핵심 신호.
-const WINDUP_COLOR = 0xff6b3d;       // 주황빨강
-const DODGE_COLOR = 0x6dd9e3;        // 시안 — i-frame 시각 신호
+// 캐릭터 sprite 사양: 256x256, 발 중앙 (128, 240).
+// anchor = (128/256, 240/256) → sim의 (p.x, p.y)(발 끝)와 sprite 발 끝이 일치.
+// 사양이 바뀌면 placeholder 생성 스크립트와 이 값을 같이 바꿔야 함.
+const ANCHOR_X = 128 / 256;
+const ANCHOR_Y = 240 / 256;
+const CHAR_SPRITE_SCALE = 1.0;
 
-function lerpHexColor(from: string, to: number, t: number): number {
-  const f = parseInt(from.slice(1), 16);
-  const fr = (f >> 16) & 0xff, fg = (f >> 8) & 0xff, fb = f & 0xff;
+// P1/P2 색 구분은 sprite tint로. sprite는 흑백 실루엣이라 tint가 그대로 액센트 색이 됨.
+const TINT_P1 = 0xa8d8ff;        // 시원한 청색
+const TINT_P2 = 0xffb87a;        // 따뜻한 주황
+const TINT_WINDUP = 0xff6b3d;    // 주황빨강 — windup telegraph
+const TINT_DODGE = 0x6dd9e3;     // 시안 — 회피 시각 신호 (i-frame 아님, 단순 시각 식별용)
+const TINT_HIT_FLASH = 0xffffff; // 피격 흰 플래시
+
+const PLAYER_TINTS: readonly number[] = [TINT_P1, TINT_P2];
+
+function pickTexture(state: CharState, t: CharTextures) {
+  switch (state.kind) {
+    case 'idle': return t.idle;
+    case 'windup': return t.windup;
+    case 'active': return t.active;
+    case 'recovery': return t.recovery;
+    case 'dodge': return t.dodge;
+  }
+}
+
+function lerpColor(from: number, to: number, t: number): number {
+  const fr = (from >> 16) & 0xff, fg = (from >> 8) & 0xff, fb = from & 0xff;
   const tr = (to >> 16) & 0xff, tg = (to >> 8) & 0xff, tb = to & 0xff;
   const r = Math.round(fr + (tr - fr) * t);
   const g = Math.round(fg + (tg - fg) * t);
@@ -17,135 +39,110 @@ function lerpHexColor(from: string, to: number, t: number): number {
   return (r << 16) | (g << 8) | b;
 }
 
-function bodyColor(p: Player, baseColor: string): number | string {
-  if (p.hitFlashFrames > 0) return '#ffffff';
+function tintFor(p: Player, base: number): number {
+  if (p.hitFlashFrames > 0) return TINT_HIT_FLASH;
   if (p.state.kind === 'windup') {
     const t = p.state.frame / p.state.action.windupFrames;
-    const blend = 0.4 + 0.55 * t;
-    return lerpHexColor(baseColor, WINDUP_COLOR, blend);
+    return lerpColor(base, TINT_WINDUP, 0.35 + 0.55 * t);
   }
-  if (p.state.kind === 'dodge') {
-    return DODGE_COLOR;
-  }
-  return baseColor;
+  if (p.state.kind === 'dodge') return TINT_DODGE;
+  return base;
 }
-
-// 시뮬레이션의 거울. World를 읽어 Pixi 씬 그래프를 갱신한다.
-// 잔상(afterimage)과 hit flash 같은 순수 시각 효과는 여기서만 처리 — sim에 누수되지 않게.
 
 interface PlayerView {
-  body: Graphics;
+  sprite: Sprite;
 }
 
-const PLAYER_COLORS = ['#e3c46d', '#6d9ee3'];
-
-interface Afterimage {
-  x: number;
-  y: number;
-  facing: 1 | -1;
-  color: string;
-  age: number;       // ticks elapsed
+interface AfterimageRec {
+  sprite: Sprite;
+  age: number;
   maxAge: number;
 }
 
-const AFTERIMAGE_MAX_AGE = 18;     // ~300ms — active 종료 후 자연스럽게 페이드
+const AFTERIMAGE_MAX_AGE = 18;       // ~300ms 후 페이드 아웃
 const AFTERIMAGE_START_ALPHA = 0.55;
 
+// 시뮬레이션의 거울. World를 읽어 Pixi 씬을 갱신한다.
+// 잔상/hit flash 같은 순수 시각 효과는 여기서만 처리 — sim에 누수되지 않게.
 export class WorldView {
   readonly stage: Container;
-  private readonly groundLayer: Container;
+  private readonly bgLayer: Container;
   private readonly afterimageLayer: Container;
   private readonly characterLayer: Container;
 
   private readonly playerViews = new Map<number, PlayerView>();
-  private readonly afterimages: Afterimage[] = [];
+  private readonly afterimages: AfterimageRec[] = [];
   private lastSeenTick = -1;
 
-  constructor(app: Application) {
+  constructor(app: Application, private readonly tex: GameTextures) {
     this.stage = new Container();
     app.stage.addChild(this.stage);
 
-    // z-order: ground < afterimage < character
-    this.groundLayer = new Container();
+    // z-order: bg < afterimage < character
+    this.bgLayer = new Container();
     this.afterimageLayer = new Container();
     this.characterLayer = new Container();
-    this.stage.addChild(this.groundLayer, this.afterimageLayer, this.characterLayer);
+    this.stage.addChild(this.bgLayer, this.afterimageLayer, this.characterLayer);
 
-    const ground = new Graphics();
-    ground.rect(0, GROUND_Y, STAGE_W, STAGE_H - GROUND_Y).fill('#2a2e38');
-    ground.rect(0, GROUND_Y, STAGE_W, 2).fill('#3a3f4e');
-    this.groundLayer.addChild(ground);
+    const bg = new Sprite(tex.bg);
+    bg.width = STAGE_W;
+    bg.height = STAGE_H;
+    this.bgLayer.addChild(bg);
   }
 
   sync(world: World, _alpha: number): void {
-    // Tick 경계에서만 잔상 기록/노화. 렌더 frame과 sim tick은 다르므로 한 번만.
+    // Tick 경계에서만 잔상 기록/노화. rAF는 가변이므로 한 tick에 한 번.
     if (world.tick !== this.lastSeenTick) {
       this.lastSeenTick = world.tick;
       this.advanceAfterimages(world);
     }
 
-    // 캐릭터 mirror
     for (const p of world.players) {
       let pv = this.playerViews.get(p.id);
       if (!pv) {
-        const body = new Graphics();
-        pv = { body };
-        this.characterLayer.addChild(body);
+        const sprite = new Sprite(this.tex.samurai.idle);
+        sprite.anchor.set(ANCHOR_X, ANCHOR_Y);
+        sprite.scale.set(CHAR_SPRITE_SCALE);
+        this.characterLayer.addChild(sprite);
+        pv = { sprite };
         this.playerViews.set(p.id, pv);
       }
-      const baseColor = PLAYER_COLORS[p.id] ?? '#cccccc';
-      const color = bodyColor(p, baseColor);
-      pv.body.clear();
-      pv.body.rect(-CHAR_W / 2, -CHAR_H, CHAR_W, CHAR_H).fill(color);
-      pv.body.position.set(p.x, p.y);
-      pv.body.scale.x = p.facing;
+      pv.sprite.texture = pickTexture(p.state, this.tex.samurai);
+      pv.sprite.position.set(p.x, p.y);
+      // facing 미러: anchor 기준으로 좌우 반전. Sprite는 음수 scale 지원.
+      pv.sprite.scale.x = CHAR_SPRITE_SCALE * p.facing;
+      pv.sprite.scale.y = CHAR_SPRITE_SCALE;
+      const base = PLAYER_TINTS[p.id] ?? 0xffffff;
+      pv.sprite.tint = tintFor(p, base);
     }
   }
 
   private advanceAfterimages(world: World): void {
-    // active(공격) 또는 dodge(회피) 동안 잔상 기록.
+    // active(공격) 또는 dodge(회피) 동안 매 tick 잔상 1장 기록.
     for (const p of world.players) {
-      if (p.state.kind === 'active') {
-        this.afterimages.push({
-          x: p.x,
-          y: p.y,
-          facing: p.facing,
-          color: PLAYER_COLORS[p.id] ?? '#cccccc',
-          age: 0,
-          maxAge: AFTERIMAGE_MAX_AGE,
-        });
-      } else if (p.state.kind === 'dodge') {
-        // 회피 잔상은 시안 톤 — i-frame을 시각적으로 강조
-        this.afterimages.push({
-          x: p.x,
-          y: p.y,
-          facing: p.facing,
-          color: '#6dd9e3',
-          age: 0,
-          maxAge: AFTERIMAGE_MAX_AGE,
-        });
-      }
+      if (p.state.kind !== 'active' && p.state.kind !== 'dodge') continue;
+      const texture = pickTexture(p.state, this.tex.samurai);
+      const s = new Sprite(texture);
+      s.anchor.set(ANCHOR_X, ANCHOR_Y);
+      s.scale.set(CHAR_SPRITE_SCALE);
+      s.scale.x = CHAR_SPRITE_SCALE * p.facing;
+      s.position.set(p.x, p.y);
+      s.tint = p.state.kind === 'dodge' ? TINT_DODGE : (PLAYER_TINTS[p.id] ?? 0xffffff);
+      s.alpha = AFTERIMAGE_START_ALPHA;
+      this.afterimageLayer.addChild(s);
+      this.afterimages.push({ sprite: s, age: 0, maxAge: AFTERIMAGE_MAX_AGE });
     }
 
-    // 노화 + 만료 제거
+    // 노화 + 알파 페이드 + 만료 destroy
     for (let i = this.afterimages.length - 1; i >= 0; i--) {
       const a = this.afterimages[i]!;
       a.age++;
-      if (a.age >= a.maxAge) this.afterimages.splice(i, 1);
-    }
-
-    // 다시 그리기 (max 잔상 ~수십 개라 단순 재생성으로 충분)
-    while (this.afterimageLayer.children.length > 0) {
-      this.afterimageLayer.children[0]!.destroy();
-    }
-    for (const a of this.afterimages) {
-      const g = new Graphics();
-      g.rect(-CHAR_W / 2, -CHAR_H, CHAR_W, CHAR_H).fill(a.color);
-      g.position.set(a.x, a.y);
-      g.scale.x = a.facing;
-      const t = a.age / a.maxAge; // 0 → 1
-      g.alpha = AFTERIMAGE_START_ALPHA * (1 - t);
-      this.afterimageLayer.addChild(g);
+      const t = a.age / a.maxAge;
+      a.sprite.alpha = AFTERIMAGE_START_ALPHA * (1 - t);
+      if (a.age >= a.maxAge) {
+        a.sprite.destroy();
+        this.afterimages.splice(i, 1);
+      }
     }
   }
 }

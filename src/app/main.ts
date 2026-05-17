@@ -9,6 +9,7 @@ import {
 } from '../input/sources.js';
 import { createWorld } from '../sim/world.js';
 import { createPixiApp } from '../render/app.js';
+import { loadAssets } from '../render/assets.js';
 import { DebugOverlay } from '../render/debugOverlay.js';
 import { WorldView } from '../render/view.js';
 import { startLoop } from './loop.js';
@@ -21,7 +22,12 @@ async function main(): Promise<void> {
   window.addEventListener('contextmenu', (e) => e.preventDefault());
 
   const app = await createPixiApp(stageEl);
-  const view = new WorldView(app);
+
+  // 게임 시작 전 모든 텍스처 사전 로드 — sync(world) 안에서 await 없이 즉시 swap 가능하게.
+  hudEl.textContent = 'loading assets...';
+  const textures = await loadAssets();
+
+  const view = new WorldView(app, textures);
   const debug = new DebugOverlay(app);
 
   const kb = new KeyboardState();
